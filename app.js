@@ -8,6 +8,7 @@ const state = {
   index: 0,
   order: [],
   picked: new Set(),
+  draft: "",
   locked: false,
   revealed: false,
   verdict: null
@@ -27,9 +28,13 @@ function bucket() {
 function norm(s) {
   return String(s || "").trim().replace(/\s+/g, "").replace(/[。．.、，,]/g, "");
 }
-function fillHit(input, answers) {
+function fillOutcome(input, answers) {
   const n = norm(input);
-  return answers.some((a) => norm(a) === n);
+  if (!n) return "empty";
+  const accepted = answers.map((a) => norm(a));
+  if (accepted.includes(n)) return "ok";
+  if (accepted.some((a) => a.startsWith(n))) return "pending";
+  return "bad";
 }
 function sameSet(a, b) {
   if (a.length !== b.length) return false;
@@ -63,11 +68,28 @@ function resetOrder() {
   state.index = 0;
   clearAttempt();
 }
+let fillTimer = 0;
+function clearFillTimer() {
+  clearTimeout(fillTimer);
+  fillTimer = 0;
+}
 function clearAttempt() {
+  clearFillTimer();
   state.picked = new Set();
+  state.draft = "";
   state.locked = false;
   state.revealed = false;
   state.verdict = null;
+}
+function grade(q, ok) {
+  clearFillTimer();
+  const all = bucket();
+  if (ok) { all[state.view].ok[q.id] = true; delete all[state.view].bad[q.id]; }
+  else { all[state.view].bad[q.id] = true; delete all[state.view].ok[q.id]; }
+  saveStore(all);
+  state.locked = true;
+  state.verdict = ok ? "ok" : "bad";
+  render();
 }
 function tallyText() {
   const s = loadStore();
@@ -85,8 +107,8 @@ function renderHome() {
   document.getElementById("tally").textContent = tallyText();
   document.getElementById("app").innerHTML = `
     <div class="modes">
-      <button class="mode" data-go="fill"><strong>填空</strong><span>${counts.fill} 题。空位只考关键词，答错会给出正确答案。</span></button>
-      <button class="mode" data-go="choice"><strong>选择</strong><span>${counts.choice} 题。单选和多选都会判对错，多选须选全。</span></button>
+      <button class="mode" data-go="fill"><strong>填空</strong><span>${counts.fill} 题。写到关键词自动判断，答错会给出正确答案。</span></button>
+      <button class="mode" data-go="choice"><strong>选择</strong><span>${counts.choice} 题。点选后自动判断，多选须选全。</span></button>
       <button class="mode" data-go="short"><strong>简答</strong><span>${counts.short} 题。只展示标准答案，不判断你写得对不对。</span></button>
     </div>`;
   document.getElementById("app").querySelectorAll("[data-go]").forEach((btn) => {
@@ -158,9 +180,8 @@ function fillBody(q) {
       ? `<p class="verdict bad">错了。正确答案：${escapeHtml(q.answers[0])}</p>`
       : `<p class="verdict"></p>`;
   return `
-    <p class="stem blank">${escapeHtml(before)}<input id="blank" class="${cls}" ${state.locked ? "disabled" : ""} aria-label="填空"> ${escapeHtml(after || "")}</p>
-    ${verdict}
-    ${state.locked ? "" : `<button type="button" class="check" id="check">核对</button>`}`;
+    <p class="stem blank">${escapeHtml(before)}<input id="blank" class="${cls}" value="${escapeHtml(state.draft)}" ${state.locked ? "disabled" : ""} aria-label="填空"> ${escapeHtml(after || "")}</p>
+    ${verdict}`;
 }
 function choiceBody(q) {
   const letters = "ABCDEFGHIJ";
@@ -178,12 +199,11 @@ function choiceBody(q) {
     ? `<p class="verdict ok">对了。<span class="seal">对</span></p>`
     : state.verdict === "bad"
       ? `<p class="verdict bad">错了。正确答案：${q.answer.map((i) => letters[i]).join("、")}</p>`
-      : `<p class="verdict"></p>`;
+      : `<p class="verdict">${q.multi && state.picked.size ? "选全后自动判断。" : ""}</p>`;
   return `
-    <p class="stem">${escapeHtml(q.stem)}${q.multi ? "（多选）" : ""}</p>
+    <p class="stem">${escapeHtml(q.stem)}${q.multi && !q.stem.includes("多选") ? "（多选）" : ""}</p>
     <div class="options">${opts}</div>
-    ${verdict}
-    ${state.locked ? "" : `<button type="button" class="check" id="check">核对</button>`}`;
+    ${verdict}`;
 }
 function shortBody(q) {
   const answer = state.revealed
@@ -204,21 +224,44 @@ function bindBar() {
 }
 function bindFill(q) {
   const input = document.getElementById("blank");
-  const check = document.getElementById("check");
-  if (!input || !check) return;
+  if (!input || state.locked) return;
   input.focus();
-  const go = () => {
-    const ok = fillHit(input.value, q.answers);
-    const all = bucket();
-    if (ok) { all[state.view].ok[q.id] = true; delete all[state.view].bad[q.id]; }
-    else { all[state.view].bad[q.id] = true; delete all[state.view].ok[q.id]; }
-    saveStore(all);
-    state.locked = true;
-    state.verdict = ok ? "ok" : "bad";
-    render();
+  const end = input.value.length;
+  input.setSelectionRange(end, end);
+  let composing = false;
+  const settle = (force) => {
+    state.draft = input.value;
+    const outcome = fillOutcome(input.value, q.answers);
+    if (outcome === "ok") grade(q, true);
+    else if (outcome === "bad" || (force && outcome === "pending")) grade(q, false);
   };
-  check.onclick = go;
-  input.addEventListener("keydown", (e) => { if (e.key === "Enter") go(); });
+  const watch = () => {
+    if (composing) return;
+    clearFillTimer();
+    const outcome = fillOutcome(input.value, q.answers);
+    if (outcome === "pending") {
+      state.draft = input.value;
+      fillTimer = setTimeout(() => {
+        if (state.locked || current()?.id !== q.id) return;
+        settle(true);
+      }, 700);
+      return;
+    }
+    settle(false);
+  };
+  input.addEventListener("compositionstart", () => { composing = true; clearFillTimer(); });
+  input.addEventListener("compositionend", () => { composing = false; watch(); });
+  input.addEventListener("input", (e) => {
+    if (e.isComposing || composing) return;
+    watch();
+  });
+  input.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    clearFillTimer();
+    if (!norm(input.value)) return;
+    settle(true);
+  });
 }
 function bindChoice(q) {
   document.querySelectorAll(".opt input").forEach((el) => {
@@ -228,28 +271,22 @@ function bindChoice(q) {
       } else {
         state.picked = new Set([Number(el.value)]);
       }
-      document.querySelectorAll(".opt").forEach((lab) => {
-        const box = lab.querySelector("input");
-        lab.classList.toggle("picked", box.checked);
-      });
+      const picked = [...state.picked];
+      if (!q.multi) {
+        grade(q, sameSet(picked, q.answer));
+        return;
+      }
+      if (picked.some((i) => !q.answer.includes(i))) grade(q, false);
+      else if (sameSet(picked, q.answer)) grade(q, true);
+      else {
+        document.querySelectorAll(".opt").forEach((lab) => {
+          lab.classList.toggle("picked", lab.querySelector("input").checked);
+        });
+        const verdict = document.querySelector(".verdict");
+        if (verdict) verdict.textContent = picked.length ? "选全后自动判断。" : "";
+      }
     });
   });
-  const check = document.getElementById("check");
-  if (!check) return;
-  check.onclick = () => {
-    if (!state.picked.size) {
-      document.querySelector(".verdict").textContent = "先选择一项。";
-      return;
-    }
-    const ok = sameSet([...state.picked], q.answer);
-    const all = bucket();
-    if (ok) { all[state.view].ok[q.id] = true; delete all[state.view].bad[q.id]; }
-    else { all[state.view].bad[q.id] = true; delete all[state.view].ok[q.id]; }
-    saveStore(all);
-    state.locked = true;
-    state.verdict = ok ? "ok" : "bad";
-    render();
-  };
 }
 function bindShort() {
   const btn = document.getElementById("reveal");
